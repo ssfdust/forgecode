@@ -262,6 +262,9 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
 
         // Retrieve the number of requests allowed per tick.
         let max_requests_per_turn = self.agent.max_requests_per_turn;
+        // TODO(acp): when running in ACP stdio mode, chain `.silent(true)`
+        // so that shell tool output is suppressed on stdout (see
+        // ToolCallContext and tool_executor).
         let tool_context =
             ToolCallContext::new(self.conversation.metrics.clone()).sender(self.sender.clone());
 
