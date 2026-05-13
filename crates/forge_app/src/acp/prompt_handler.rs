@@ -162,7 +162,14 @@ impl<S> AcpAdapter<S> {
                         .map_err(error::into_acp_error)?;
                 }
             }
-            ChatResponse::ToolCallStart { tool_call, .. } => {
+            ChatResponse::ToolCallStart { tool_call, notifier } => {
+                // Signal the orchestrator that we've processed the start
+                // notification. Without this, the orchestrator hangs
+                // indefinitely at notifier.notified().await because it
+                // expects the consumer to acknowledge the event before
+                // proceeding with tool execution.
+                notifier.notify_one();
+
                 let notification = acp::SessionNotification::new(
                     session_id.clone(),
                     acp::SessionUpdate::ToolCallUpdate(
