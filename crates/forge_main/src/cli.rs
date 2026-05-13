@@ -315,7 +315,12 @@ pub struct MachineCommandGroup {
 #[derive(Subcommand, Debug, Clone)]
 pub enum MachineCommand {
     /// Run the machine interface over stdio.
-    Stdio,
+    Stdio {
+        /// Use stdin for ACP JSON-RPC transport. Skips the piped-input
+        /// pre-read so the subcommand can take ownership of stdin.
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 /// Command group for workspace management.
@@ -2047,7 +2052,7 @@ mod tests {
         let actual = matches!(
             fixture.subcommands,
             Some(TopLevelCommand::Machine(MachineCommandGroup {
-                command: MachineCommand::Stdio,
+                command: MachineCommand::Stdio { .. },
             }))
         );
         let expected = true;

@@ -475,7 +475,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
             }
             TopLevelCommand::Machine(machine_group) => {
                 match machine_group.command {
-                    crate::cli::MachineCommand::Stdio => {
+                    crate::cli::MachineCommand::Stdio { .. } => {
                         crate::acp_runner::run_machine_stdio_server(self.api.as_ref()).await?;
                         return Ok(());
                     }
