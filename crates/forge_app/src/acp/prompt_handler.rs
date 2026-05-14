@@ -84,7 +84,7 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
         let mut event = Event::new(EventValue::text(prompt_text));
         event.attachments = attachments;
 
-        let mut chat_request = ChatRequest::new(event, session.conversation_id);
+        let mut chat_request = ChatRequest::new(event, session.conversation_id).tool_silent(true);
         loop {
             // Check if cancellation was requested before starting a new
             // chat round (handles the case where cancel arrives between
@@ -129,7 +129,7 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
             }
 
             if continue_after_interrupt {
-                chat_request = ChatRequest::new(Event::new(EventValue::text("")), session.conversation_id);
+                chat_request = ChatRequest::new(Event::new(EventValue::text("")), session.conversation_id).tool_silent(true);
                 continue;
             }
 

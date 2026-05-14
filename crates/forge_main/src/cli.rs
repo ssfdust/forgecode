@@ -82,7 +82,13 @@ impl Cli {
     /// Commands like `forge select` interactively read from stdin and would
     /// hang if the startup pipeline consumed stdin first.
     pub fn uses_stdin(&self) -> bool {
-        matches!(&self.subcommands, Some(TopLevelCommand::Select(_)))
+        match &self.subcommands {
+            Some(TopLevelCommand::Select(_)) => true,
+            Some(TopLevelCommand::Machine(MachineCommandGroup {
+                command: MachineCommand::Stdio { stdin },
+            })) => *stdin,
+            _ => false,
+        }
     }
 }
 
@@ -2064,6 +2070,18 @@ mod tests {
                 command: MachineCommand::Stdio { .. },
             }))
         );
+        let expected = true;
+        assert_eq!(actual, expected);
+
+        let actual = fixture.uses_stdin();
+        let expected = false;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_machine_stdio_stdin_flag() {
+        let fixture = Cli::parse_from(["forge", "machine", "stdio", "--stdin"]);
+        let actual = fixture.uses_stdin();
         let expected = true;
         assert_eq!(actual, expected);
     }
