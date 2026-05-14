@@ -11,9 +11,6 @@ pub struct AcpApp<S> {
     services: Arc<S>,
 }
 
-/// Maximum time to wait for ACP I/O before considering the client hung.
-const IO_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// Maximum time to wait for pending notifications to drain on shutdown.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -82,19 +79,11 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpApp<S> {
                             }
                         });
 
-                        // Wait for I/O with a timeout to prevent indefinite hangs
-                        // when the client stalls.
-                        let io_result = match tokio::time::timeout(IO_TIMEOUT, handle_io).await {
-                            Ok(result) => result,
-                            Err(_) => {
-                                tracing::warn!("ACP I/O timed out after {:?}", IO_TIMEOUT);
-                                notification_task.abort();
-                                return Err(anyhow::anyhow!(
-                                    "ACP transport timed out after {:?}",
-                                    IO_TIMEOUT
-                                ));
-                            }
-                        };
+                        // handle_io runs for the lifetime of the stdio connection.
+                        // It returns naturally when stdin closes (client exits).
+                        // The OS guarantees pipe cleanup on process termination,
+                        // so an explicit idle timeout is unnecessary.
+                        let io_result = handle_io.await;
 
                         // Graceful shutdown: give the notification task time to
                         // drain pending messages instead of aborting immediately.
