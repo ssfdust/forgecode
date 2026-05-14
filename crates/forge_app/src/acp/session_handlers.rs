@@ -20,11 +20,17 @@ impl<S> AcpAdapter<S> {
 
         Ok(acp::InitializeResponse::new(acp::ProtocolVersion::V1)
             .agent_capabilities(
-                acp::AgentCapabilities::new().load_session(true).mcp_capabilities(
-                    acp::McpCapabilities::new()
-                        .http(true)
-                        .sse(true),
-                ),
+                acp::AgentCapabilities::new()
+                    .load_session(true)
+                    .session_capabilities(
+                        acp::SessionCapabilities::new()
+                            .list(acp::SessionListCapabilities::new()),
+                    )
+                    .mcp_capabilities(
+                        acp::McpCapabilities::new()
+                            .http(true)
+                            .sse(true),
+                    ),
             )
             .agent_info(
                 acp::Implementation::new("forge".to_string(), VERSION.to_string())
@@ -172,6 +178,44 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
         Ok(acp::LoadSessionResponse::new()
             .modes(mode_state)
             .models(model_state))
+    }
+
+    pub(super) async fn handle_list_sessions(
+        &self,
+        _arguments: acp::ListSessionsRequest,
+    ) -> std::result::Result<acp::ListSessionsResponse, acp::Error> {
+        let config = self
+            .services
+            .get_config()
+            .map_err(|error| acp::Error::into_internal_error(&*error))?;
+
+        let conversations = self
+            .services
+            .conversation_service()
+            .get_conversations(Some(config.max_conversations))
+            .await
+            .map_err(|error| acp::Error::into_internal_error(&*error))?
+            .unwrap_or_default();
+
+        let sessions = conversations
+            .into_iter()
+            .map(|conversation| {
+                let env = self.services.get_environment();
+                acp::SessionInfo::new(
+                    acp::SessionId::new(conversation.id.into_string()),
+                    env.cwd,
+                )
+                .title(conversation.title.unwrap_or_default())
+                .updated_at(
+                    conversation
+                        .metadata
+                        .updated_at
+                        .map(|t| t.to_rfc3339()),
+                )
+            })
+            .collect();
+
+        Ok(acp::ListSessionsResponse::new(sessions))
     }
 
     /// Handles session model changes.
@@ -1132,6 +1176,7 @@ mod tests {
 
         assert_eq!(actual.protocol_version, acp::ProtocolVersion::V1);
         assert!(actual.agent_capabilities.load_session);
+        assert!(actual.agent_capabilities.session_capabilities.list.is_some());
         assert!(actual.agent_capabilities.mcp_capabilities.http);
         assert!(actual.agent_capabilities.mcp_capabilities.sse);
     }
@@ -1319,5 +1364,55 @@ mod tests {
 
         let notification = rx.recv().await.expect("expected model change notification");
         assert_eq!(notification.session_id, session_id);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_all_conversations_as_sessions() {
+        let services = MockServices::new();
+        let adapter = AcpAdapter::new_for_test(services.clone());
+
+        // Insert two conversations.
+        let mut conversation_1 = Conversation::generate();
+        conversation_1.title = Some("Session 1".to_string());
+        conversation_1.metadata.updated_at = Some(chrono::DateTime::UNIX_EPOCH);
+        services.insert_conversation(conversation_1);
+
+        let mut conversation_2 = Conversation::generate();
+        conversation_2.title = Some("Session 2".to_string());
+        conversation_2.metadata.updated_at = Some(chrono::DateTime::UNIX_EPOCH);
+        services.insert_conversation(conversation_2);
+
+        let actual = adapter
+            .handle_list_sessions(acp::ListSessionsRequest::new())
+            .await
+            .unwrap();
+
+        // Should return all inserted sessions (ordered by insertion).
+        let session_ids: Vec<String> = actual
+            .sessions
+            .iter()
+            .map(|s| s.session_id.0.to_string())
+            .collect();
+        assert_eq!(session_ids.len(), 2);
+        // Verify each session has the expected fields.
+        for session in &actual.sessions {
+            assert!(session.session_id.0.len() > 0);
+            assert!(session.title.is_some());
+            assert!(session.updated_at.is_some());
+            assert_eq!(session.cwd, PathBuf::from("/tmp/project"));
+        }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_empty_when_no_conversations() {
+        let services = MockServices::new();
+        let adapter = AcpAdapter::new_for_test(services);
+
+        let actual = adapter
+            .handle_list_sessions(acp::ListSessionsRequest::new())
+            .await
+            .unwrap();
+
+        assert!(actual.sessions.is_empty());
     }
 }

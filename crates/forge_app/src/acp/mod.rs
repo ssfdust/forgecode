@@ -87,4 +87,14 @@ impl<S: crate::Services + crate::EnvironmentInfra<Config = forge_config::ForgeCo
     > {
         self.handle_set_session_model(arguments).await
     }
+
+    async fn list_sessions(
+        &self,
+        arguments: agent_client_protocol::ListSessionsRequest,
+    ) -> std::result::Result<
+        agent_client_protocol::ListSessionsResponse,
+        agent_client_protocol::Error,
+    > {
+        self.handle_list_sessions(arguments).await
+    }
 }
