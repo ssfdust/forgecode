@@ -53,7 +53,7 @@ fn format_todo_line(todo: &Todo, line_style: TodoLineStyle) -> String {
 ///
 /// * `before` - Previous todo list state.
 /// * `after` - New todo list state.
-pub(crate) fn format_todos_diff(before: &[Todo], after: &[Todo]) -> String {
+pub fn format_todos_diff(before: &[Todo], after: &[Todo]) -> String {
     use console::style;
 
     let before_map: std::collections::HashMap<&str, &Todo> =
@@ -119,7 +119,9 @@ pub(crate) fn format_todos_diff(before: &[Todo], after: &[Todo]) -> String {
 /// # Arguments
 ///
 /// * `todos` - Todo list to format.
-pub(crate) fn format_todos(todos: &[Todo]) -> String {
+// Kept as public utility for external consumers (e.g. snapshot rendering).
+#[allow(dead_code)]
+pub fn format_todos(todos: &[Todo]) -> String {
     if todos.is_empty() {
         return String::new();
     }
@@ -141,12 +143,9 @@ mod tests {
         colors_enabled, colors_enabled_stderr, set_colors_enabled, set_colors_enabled_stderr,
         strip_ansi_codes,
     };
-    use forge_domain::{ChatResponseContent, Environment, Todo, TodoStatus};
+    use forge_domain::{Todo, TodoStatus};
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
-
-    use crate::fmt::content::FormatContent;
-    use crate::operation::ToolOperation;
 
     static ANSI_STYLE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -172,11 +171,6 @@ mod tests {
         }
     }
 
-    fn fixture_environment() -> Environment {
-        use fake::{Fake, Faker};
-        Faker.fake()
-    }
-
     fn fixture_todo(content: &str, id: &str, status: TodoStatus) -> Todo {
         Todo::new(content).id(id).status(status)
     }
@@ -186,14 +180,7 @@ mod tests {
             .lock()
             .expect("ANSI style lock should not be poisoned");
         let _colors = ColorStateGuard::force_enabled();
-        let setup = ToolOperation::TodoWrite { before, after };
-        let actual = setup.to_content(&fixture_environment());
-
-        if let Some(ChatResponseContent::ToolOutput(output)) = actual {
-            output
-        } else {
-            panic!("Expected ToolOutput content")
-        }
+        super::format_todos_diff(&before, &after)
     }
 
     #[test]
@@ -234,14 +221,8 @@ mod tests {
     }
 
     fn fixture_todo_write_output(before: Vec<Todo>, after: Vec<Todo>) -> String {
-        let setup = ToolOperation::TodoWrite { before, after };
-        let actual = setup.to_content(&fixture_environment());
-
-        if let Some(ChatResponseContent::ToolOutput(output)) = actual {
-            strip_ansi_codes(output.as_str()).to_string()
-        } else {
-            panic!("Expected ToolOutput content")
-        }
+        let actual = super::format_todos_diff(&before, &after);
+        strip_ansi_codes(actual.as_str()).to_string()
     }
 
     #[test]

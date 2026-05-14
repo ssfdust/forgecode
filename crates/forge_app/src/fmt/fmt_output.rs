@@ -2,7 +2,7 @@ use forge_display::DiffFormat;
 use forge_domain::{ChatResponseContent, Environment, TitleFormat};
 
 use crate::fmt::content::FormatContent;
-use crate::fmt::todo_fmt::{format_todos, format_todos_diff};
+use crate::fmt::todo_fmt::format_todos;
 use crate::operation::ToolOperation;
 use crate::utils::format_display_path;
 
@@ -38,13 +38,14 @@ impl FormatContent for ToolOperation {
                 ));
                 title.into()
             }),
-            ToolOperation::TodoWrite { before, after } => Some(ChatResponseContent::ToolOutput(
-                format_todos_diff(before, after),
-            )),
             ToolOperation::TodoRead { output } => {
                 Some(ChatResponseContent::ToolOutput(format_todos(output)))
             }
-            ToolOperation::FsRead { input: _, output: _ }
+            // Rendering is delegated to consumers (CLI updates its own terminal
+            // view via format_todos_diff, ACP sends structured Plan via
+            // TodoUpdate). The executor layer no longer pre-renders ANSI text.
+            ToolOperation::TodoWrite { before: _, after: _ }
+            | ToolOperation::FsRead { input: _, output: _ }
             | ToolOperation::FsRemove { input: _, output: _ }
             | ToolOperation::FsSearch { input: _, output: _ }
             | ToolOperation::CodebaseSearch { output: _ }

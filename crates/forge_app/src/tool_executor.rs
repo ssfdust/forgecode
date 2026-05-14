@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use forge_domain::{CodebaseQueryResult, ToolCallContext, ToolCatalog, ToolOutput};
+use forge_domain::{ChatResponse, CodebaseQueryResult, ToolCallContext, ToolCatalog, ToolOutput};
 
 use crate::fmt::content::FormatContent;
 use crate::operation::{TempContentFiles, ToolOperation};
@@ -326,6 +326,14 @@ impl<
                 let before = context.get_todos()?;
                 context.update_todos(input.todos.clone())?;
                 let after = context.get_todos()?;
+                // Emit structured update for consumers that need structured
+                // data (e.g. ACP Plan notification, CLI terminal rendering).
+                context
+                    .send(ChatResponse::TodoUpdate {
+                        before: before.clone(),
+                        after: after.clone(),
+                    })
+                    .await?;
                 ToolOperation::TodoWrite { before, after }
             }
             ToolCatalog::TodoRead(_input) => {

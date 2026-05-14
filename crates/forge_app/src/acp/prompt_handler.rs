@@ -5,7 +5,7 @@ use agent_client_protocol as acp;
 use agent_client_protocol::Client;
 use forge_config::ForgeConfig;
 use forge_domain::{
-    ChatRequest, ChatResponse, ChatResponseContent, Event, EventValue, InterruptionReason,
+    ChatRequest, ChatResponse, ChatResponseContent, Event, EventValue, InterruptionReason, Todo,
 };
 use futures::StreamExt;
 use tokio::sync::Notify;
@@ -202,6 +202,16 @@ impl<S> AcpAdapter<S> {
                 self.send_notification(notification)
                     .map_err(error::into_acp_error)?;
             }
+            ChatResponse::TodoUpdate { before: _, after } => {
+                let notification = acp::SessionNotification::new(
+                    session_id.clone(),
+                    acp::SessionUpdate::Plan(acp::Plan::new(
+                        Self::todos_to_plan_entries(&after),
+                    )),
+                );
+                self.send_notification(notification)
+                    .map_err(error::into_acp_error)?;
+            }
             ChatResponse::TaskComplete => {}
             ChatResponse::RetryAttempt { .. } => {}
             ChatResponse::Interrupt { reason } => {
@@ -289,6 +299,36 @@ impl<S> AcpAdapter<S> {
             }
             acp::RequestPermissionOutcome::Cancelled => Ok(false),
             _ => Ok(false),
+        }
+    }
+
+    /// Convert forge `Todo` items into ACP `PlanEntry` items for session
+    /// notification.
+    fn todos_to_plan_entries(todos: &[Todo]) -> Vec<acp::PlanEntry> {
+        todos
+            .iter()
+            .filter(|t| t.status != forge_domain::TodoStatus::Cancelled)
+            .map(|todo| {
+                let priority = match todo.status {
+                    forge_domain::TodoStatus::InProgress => acp::PlanEntryPriority::High,
+                    _ => acp::PlanEntryPriority::Medium,
+                };
+                let status = Self::map_todo_status(todo.status.clone());
+                acp::PlanEntry::new(todo.content.clone(), priority, status)
+            })
+            .collect()
+    }
+
+    /// Map forge `TodoStatus` to ACP `PlanEntryStatus`.
+    fn map_todo_status(status: forge_domain::TodoStatus) -> acp::PlanEntryStatus {
+        match status {
+            forge_domain::TodoStatus::Pending => acp::PlanEntryStatus::Pending,
+            forge_domain::TodoStatus::InProgress => acp::PlanEntryStatus::InProgress,
+            forge_domain::TodoStatus::Completed => acp::PlanEntryStatus::Completed,
+            forge_domain::TodoStatus::Cancelled => {
+                // filtered out in todos_to_plan_entries
+                acp::PlanEntryStatus::Pending
+            }
         }
     }
 }

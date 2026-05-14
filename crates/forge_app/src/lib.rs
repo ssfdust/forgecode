@@ -48,6 +48,7 @@ pub use app::*;
 pub use command_generator::*;
 pub use data_gen::*;
 pub use error::*;
+pub use fmt::todo_fmt::format_todos_diff;
 pub use git_app::*;
 pub use infra::*;
 pub use services::*;

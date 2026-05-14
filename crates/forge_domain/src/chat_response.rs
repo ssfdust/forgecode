@@ -5,6 +5,7 @@ use std::time::Duration;
 use chrono::Local;
 use tokio::sync::Notify;
 
+use crate::tools::Todo;
 use crate::{ToolCallFull, ToolName, ToolResult};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +65,17 @@ pub enum ChatResponse {
         tool_call: ToolCallFull,
         notifier: Arc<Notify>,
     },
+    /// Structured todo update emitted by `TodoWrite`.
+    ///
+    /// Carries the todo list state before and after the change.
+    /// Consumers (CLI, ACP) independently decide how to render it —
+    /// the executor layer is no longer responsible for pre-rendering.
+    TodoUpdate {
+        /// Todo list state before the change.
+        before: Vec<Todo>,
+        /// Todo list state after the change.
+        after: Vec<Todo>,
+    },
     ToolCallEnd(ToolResult),
     RetryAttempt {
         cause: Cause,
@@ -87,7 +99,8 @@ impl ChatResponse {
                 ChatResponseContent::ToolOutput(content) => content.is_empty(),
                 ChatResponseContent::Markdown { text, .. } => text.is_empty(),
             },
-            ChatResponse::TaskReasoning { content } => content.is_empty(),
+                    ChatResponse::TaskReasoning { content } => content.is_empty(),
+            ChatResponse::TodoUpdate { .. } => false,
             _ => false,
         }
     }

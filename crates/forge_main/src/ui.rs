@@ -4137,6 +4137,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     self.on_dump(html).await?;
                 }
             }
+            ChatResponse::TodoUpdate { before, after } => {
+                self.spinner.start(Some("Updating tasks"))?;
+                let rendered = forge_app::format_todos_diff(&before, &after);
+                writer.write(&rendered)?;
+            }
         }
         Ok(())
     }
