@@ -1,12 +1,13 @@
 use agent_client_protocol as acp;
 use forge_config::ForgeConfig;
-use forge_domain::{AgentId, ConfigOperation, Conversation, ConversationId, ModelConfig, ModelId};
+use forge_domain::{AgentId, ConfigOperation, Conversation, ConversationId, ModelConfig, ModelId, ProviderId};
 
 use crate::{AgentRegistry, AppConfigService, ConversationService, EnvironmentInfra, Services};
-
 use super::adapter::{AcpAdapter, SessionState};
 use super::error;
 use super::state_builders::StateBuilders;
+
+use std::ops::Deref;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -106,7 +107,7 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
         )
         .await
         .map_err(error::into_acp_error)?;
-        let model_state = StateBuilders::build_session_model_state(&self.services, &agent)
+        let model_state = StateBuilders::build_session_model_state(&self.services, &agent, None)
             .await
             .map_err(error::into_acp_error)?;
 
@@ -164,7 +165,7 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
         )
         .await
         .map_err(error::into_acp_error)?;
-        let model_state = StateBuilders::build_session_model_state(&self.services, &agent)
+        let model_state = StateBuilders::build_session_model_state(&self.services, &agent, state.model_id.as_ref())
             .await
             .map_err(error::into_acp_error)?;
 
@@ -183,33 +184,21 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
         arguments: acp::SetSessionModelRequest,
     ) -> std::result::Result<acp::SetSessionModelResponse, acp::Error> {
         let session_key = arguments.session_id.0.as_ref().to_string();
-        let model_id = ModelId::new(arguments.model_id.0.to_string());
 
-        // Store per-session model preference.
-        self.update_session_model(&session_key, model_id.clone())
+        // Parse the incoming model ID: format is "provider_id/model_id".
+        let (provider_id, model_id) = parse_provider_model(arguments.model_id.0.as_ref())
+            .map_err(|_| acp::Error::invalid_params())?;
+
+        // Store per-session model preference (full qualified ID).
+        let full_model_id = ModelId::new(arguments.model_id.0.as_ref().to_string());
+        self.update_session_model(&session_key, full_model_id)
             .await
             .map_err(error::into_acp_error)?;
 
-        // Also update the global default for backward compatibility.
-        let provider_id = match self.services.get_session_config().await {
-            Some(config) => config.provider,
-            None => {
-                let state = self
-                    .session_state(&session_key)
-                    .await
-                    .map_err(error::into_acp_error)?;
-                self.services
-                    .agent_registry()
-                    .get_agent(&state.agent_id)
-                    .await
-                    .map_err(|error| acp::Error::into_internal_error(&*error))?
-                    .map(|agent| agent.provider)
-                    .ok_or_else(acp::Error::invalid_params)?
-            }
-        };
+        // Update the session config with both provider and model.
         self.services
             .update_config(vec![ConfigOperation::SetSessionConfig(ModelConfig::new(
-                provider_id,
+                provider_id.clone(),
                 model_id.clone(),
             ))])
             .await
@@ -222,8 +211,8 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
             arguments.session_id,
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
                 acp::ContentBlock::Text(acp::TextContent::new(format!(
-                    "Model changed to: {}\n\n",
-                    model_id
+                    "Model changed to: {}/{}\n\n",
+                    &provider_id.deref(), model_id
                 ))),
             )),
         );
@@ -232,6 +221,81 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
         }
 
         Ok(acp::SetSessionModelResponse::default())
+    }
+}
+
+impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
+    pub(super) async fn handle_set_session_config_option(
+        &self,
+        arguments: acp::SetSessionConfigOptionRequest,
+    ) -> std::result::Result<acp::SetSessionConfigOptionResponse, acp::Error> {
+        let config_id: ConfigOptionId =
+            arguments.config_id.0.as_ref().parse().map_err(|_| {
+                acp::Error::method_not_found()
+            })?;
+
+        match config_id {
+            ConfigOptionId::Mode => {
+                let mode_request = acp::SetSessionModeRequest::new(
+                    arguments.session_id.clone(),
+                    acp::SessionModeId::new(arguments.value.0.as_ref().to_string()),
+                );
+                self.handle_set_session_mode(mode_request).await?;
+            }
+            ConfigOptionId::Model => {
+                let model_request = acp::SetSessionModelRequest::new(
+                    arguments.session_id.clone(),
+                    acp::ModelId::new(arguments.value.0.as_ref().to_string()),
+                );
+                self.handle_set_session_model(model_request).await?;
+            }
+            ConfigOptionId::ReasoningEffort => {
+                let effort: forge_domain::Effort =
+                    arguments.value.0.as_ref().parse().map_err(|_| {
+                        acp::Error::invalid_params()
+                    })?;
+                self.services
+                    .update_environment(vec![ConfigOperation::SetReasoningEffort(effort)])
+                    .await
+                    .map_err(|error| acp::Error::into_internal_error(&*error))?;
+            }
+        }
+
+        // Return updated config options for all three categories
+        let session_key = arguments.session_id.0.as_ref().to_string();
+        let state = self.session_state(&session_key).await.map_err(|_| {
+            acp::Error::into_internal_error(&*anyhow::anyhow!("Session not found"))
+        })?;
+        let agent = self
+            .services
+            .agent_registry()
+            .get_agent(&state.agent_id)
+            .await
+            .map_err(|error| acp::Error::into_internal_error(&*error))?
+            .ok_or_else(|| {
+                acp::Error::into_internal_error(&*anyhow::anyhow!(
+                    "Agent '{}' not found",
+                    state.agent_id
+                ))
+            })?;
+        let mode_state = StateBuilders::build_session_mode_state(
+            self.services.as_ref(),
+            &state.agent_id,
+        )
+        .await
+        .map_err(error::into_acp_error)?;
+        let model_state =
+            StateBuilders::build_session_model_state(&self.services, &agent, state.model_id.as_ref())
+                .await
+                .map_err(error::into_acp_error)?;
+        let config_options = StateBuilders::build_config_options(
+            self.services.as_ref(),
+            &state.agent_id,
+            &mode_state,
+            &model_state,
+        )
+        .await;
+        Ok(acp::SetSessionConfigOptionResponse::new(config_options))
     }
 }
 
@@ -271,6 +335,21 @@ impl<S> AcpAdapter<S> {
 
         Ok(acp::SetSessionModeResponse::new())
     }
+}
+
+/// Parses a `provider_id/model_id` string into its constituent parts.
+fn parse_provider_model(input: &str) -> anyhow::Result<(ProviderId, ModelId)> {
+    let (provider_str, model_str) = input.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid model ID format '{}': expected 'provider_id/model_id'",
+            input
+        )
+    })?;
+    let provider_id: ProviderId = provider_str
+        .parse()
+        .expect("ProviderId parsing is infallible");
+    let model_id = ModelId::new(model_str);
+    Ok((provider_id, model_id))
 }
 
 #[cfg(test)]
@@ -1141,7 +1220,7 @@ mod tests {
                 .models
                 .as_ref()
                 .map(|models| models.current_model_id.0.as_ref()),
-            Some("test-model")
+            Some("openai/test-model")
         );
         let session = adapter.session_state(actual.session_id.0.as_ref()).await.unwrap();
         assert_eq!(session.agent_id, AgentId::new("forge"));
@@ -1191,7 +1270,7 @@ mod tests {
                 .models
                 .as_ref()
                 .map(|models| models.current_model_id.0.as_ref()),
-            Some("test-model")
+            Some("openai/test-model")
         );
         let session = adapter
             .session_state(conversation_id.into_string().as_str())
@@ -1221,13 +1300,13 @@ mod tests {
         let actual = adapter
             .handle_set_session_model(acp::SetSessionModelRequest::new(
                 session_id.clone(),
-                acp::ModelId::new("gpt-test"),
+                acp::ModelId::new("openai/gpt-test"),
             ))
             .await;
 
         assert!(actual.is_ok());
         let session = adapter.session_state(session_id.0.as_ref()).await.unwrap();
-        assert_eq!(session.model_id, Some(ModelId::new("gpt-test")));
+        assert_eq!(session.model_id, Some(ModelId::new("openai/gpt-test")));
 
         let updates = adapter.services.config_updates();
         assert_eq!(

@@ -1,15 +1,13 @@
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use forge_domain::{
-    Agent, AgentId, McpHttpServer, McpOAuthSetting, McpServerConfig, Scope, ServerName,
-};
+use forge_domain::{Agent, AgentId, McpHttpServer, McpOAuthSetting, McpServerConfig, ModelId, Scope, ServerName};
+use futures::future::join_all;
 
-use crate::{
-    AgentProviderResolver, AgentRegistry, McpConfigManager, McpService, ProviderAuthService,
-    ProviderService, Services,
-};
+use crate::services::{AgentRegistry, ProviderAuthService, ProviderService};
+use crate::{McpConfigManager, McpService, Services};
 
 use super::conversion;
 use super::error::{Error, Result};
@@ -39,78 +37,126 @@ impl StateBuilders {
     pub(super) async fn build_session_model_state<S: Services>(
         services: &Arc<S>,
         current_agent: &Agent,
+        session_model_override: Option<&ModelId>,
     ) -> Result<acp::SessionModelState> {
-        let agent_provider_resolver = AgentProviderResolver::new(services.clone());
-        let provider = agent_provider_resolver
-            .get_provider(Some(current_agent.id.clone()))
-            .await
-            .map_err(Error::Application)?;
-        let provider = services
-            .provider_auth_service()
-            .refresh_provider_credential(provider)
+        // Fetch all configured providers and their models concurrently.
+        let all_providers = services
+            .get_all_providers()
             .await
             .map_err(Error::Application)?;
 
-        let mut models = services
-            .provider_service()
-            .models(provider)
-            .await
-            .map_err(Error::Application)?;
-        models.sort_by(|left, right| left.name.cmp(&right.name));
-
-        let available_models = models
-            .iter()
-            .map(|model| {
-                let mut model_info = acp::ModelInfo::new(
-                    model.id.to_string(),
-                    model.name.clone().unwrap_or_else(|| model.id.to_string()),
-                )
-                .description(model.description.clone());
-
-                let mut meta = serde_json::Map::new();
-                if let Some(context_length) = model.context_length {
-                    meta.insert(
-                        "contextLength".to_string(),
-                        serde_json::json!(context_length),
-                    );
+        let futures: Vec<_> = all_providers
+            .into_iter()
+            .filter_map(|any_provider| any_provider.into_configured())
+            .map(|provider| {
+                let provider_id = provider.id.clone();
+                let services = services.clone();
+                async move {
+                    let result: anyhow::Result<Vec<(forge_domain::ProviderId, forge_domain::Model)>> =
+                        async {
+                            let refreshed = services
+                                .provider_auth_service()
+                                .refresh_provider_credential(provider)
+                                .await?;
+                            let models = services.models(refreshed).await?;
+                            Ok(models
+                                .into_iter()
+                                .map(|m| (provider_id.clone(), m))
+                                .collect())
+                        }
+                        .await;
+                    result
                 }
-                if let Some(tools_supported) = model.tools_supported {
-                    meta.insert(
-                        "toolsSupported".to_string(),
-                        serde_json::json!(tools_supported),
-                    );
-                }
-                if let Some(supports_reasoning) = model.supports_reasoning {
-                    meta.insert(
-                        "supportsReasoning".to_string(),
-                        serde_json::json!(supports_reasoning),
-                    );
-                }
-                if !model.input_modalities.is_empty() {
-                    let modalities = model
-                        .input_modalities
-                        .iter()
-                        .map(|modality| format!("{:?}", modality).to_lowercase())
-                        .collect::<Vec<_>>();
-                    meta.insert("inputModalities".to_string(), serde_json::json!(modalities));
-                }
-                if !meta.is_empty() {
-                    model_info = model_info.meta(meta);
-                }
-
-                model_info
             })
             .collect();
 
+        // Execute all provider fetches concurrently, then flatten.
+        let mut all_models: Vec<(forge_domain::ProviderId, forge_domain::Model)> =
+            join_all(futures)
+                .await
+                .into_iter()
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map_err(Error::Application)?
+                .into_iter()
+                .flatten()
+                .collect();
+
+        // Sort by provider ID then model ID.
+        all_models.sort_by(|(pid_a, model_a), (pid_b, model_b)| {
+            pid_a.cmp(pid_b).then_with(|| model_a.id.as_str().cmp(model_b.id.as_str()))
+        });
+
+        // Build available models list and find current model.
+        // Use session model override if present, otherwise fall back to agent default.
+        let mut available_models = Vec::new();
+        let mut current_model_id = {
+            let raw: &str = current_agent.provider.deref().as_ref();
+            format!("{}/{}", raw, current_agent.model)
+        };
+
+        for (provider_id, model) in &all_models {
+            let provider_raw: &str = provider_id.deref().as_ref();
+            let model_id = format!("{}/{}", provider_raw, model.id);
+
+            // Check if this model matches the session override or agent default.
+            // Session override stores the full "provider/model" qualified ID.
+            if let Some(override_model_id) = session_model_override {
+                if model_id.as_str() == override_model_id.as_str() {
+                    current_model_id.clone_from(&model_id);
+                }
+            } else if model.id == current_agent.model {
+                current_model_id.clone_from(&model_id);
+            }
+
+            let display_name = format!("{}/{}", provider_raw, model.id);
+            let mut model_info =
+                acp::ModelInfo::new(model_id, display_name)
+                    .description(model.description.clone());
+
+            let mut meta = serde_json::Map::new();
+            if let Some(context_length) = model.context_length {
+                meta.insert(
+                    "contextLength".to_string(),
+                    serde_json::json!(context_length),
+                );
+            }
+            if let Some(tools_supported) = model.tools_supported {
+                meta.insert(
+                    "toolsSupported".to_string(),
+                    serde_json::json!(tools_supported),
+                );
+            }
+            if let Some(supports_reasoning) = model.supports_reasoning {
+                meta.insert(
+                    "supportsReasoning".to_string(),
+                    serde_json::json!(supports_reasoning),
+                );
+            }
+            if !model.input_modalities.is_empty() {
+                let modalities = model
+                    .input_modalities
+                    .iter()
+                    .map(|modality| format!("{:?}", modality).to_lowercase())
+                    .collect::<Vec<_>>();
+                meta.insert("inputModalities".to_string(), serde_json::json!(modalities));
+            }
+            if !meta.is_empty() {
+                model_info = model_info.meta(meta);
+            }
+
+            available_models.push(model_info);
+        }
+
         Ok(
-            acp::SessionModelState::new(current_agent.model.to_string(), available_models).meta({
-                let mut meta = serde_json::Map::new();
-                meta.insert("searchable".to_string(), serde_json::json!(true));
-                meta.insert("searchThreshold".to_string(), serde_json::json!(10));
-                meta.insert("filterable".to_string(), serde_json::json!(true));
-                meta.insert("groupBy".to_string(), serde_json::json!("provider"));
-                meta
-            }),
+            acp::SessionModelState::new(current_model_id, available_models)
+                .meta({
+                    let mut meta = serde_json::Map::new();
+                    meta.insert("searchable".to_string(), serde_json::json!(true));
+                    meta.insert("searchThreshold".to_string(), serde_json::json!(10));
+                    meta.insert("filterable".to_string(), serde_json::json!(true));
+                    meta.insert("groupBy".to_string(), serde_json::json!("provider"));
+                    meta
+                }),
         )
     }
 
