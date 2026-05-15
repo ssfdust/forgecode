@@ -6,10 +6,10 @@ use agent_client_protocol as acp;
 use forge_domain::{Agent, AgentId, McpHttpServer, McpOAuthSetting, McpServerConfig, ModelId, Scope, ServerName};
 use futures::future::join_all;
 
-use crate::services::{AgentRegistry, ProviderAuthService, ProviderService};
+use crate::services::{AgentRegistry, AppConfigService, ProviderAuthService, ProviderService};
 use crate::{McpConfigManager, McpService, Services};
 
-use super::conversion;
+use super::conversion::{self, ConfigOptionId};
 use super::error::{Error, Result};
 
 /// Maximum allowed length for an MCP server name (prevents injection).
@@ -281,6 +281,95 @@ impl StateBuilders {
             )));
         }
         Ok(())
+    }
+
+    pub(super) async fn build_config_options(
+        services: &(impl Services + ?Sized),
+        current_agent_id: &AgentId,
+        mode_state: &acp::SessionModeState,
+        model_state: &acp::SessionModelState,
+    ) -> Vec<acp::SessionConfigOption> {
+        let mut options: Vec<acp::SessionConfigOption> = Vec::new();
+
+        // ── Mode config option ────────────────────────────────────────────
+        let mode_select_options: Vec<acp::SessionConfigSelectOption> = mode_state
+            .available_modes
+            .iter()
+            .map(|m| {
+                acp::SessionConfigSelectOption::new(
+                    m.id.0.as_ref().to_string(),
+                    m.id.0.as_ref().to_string(),
+                )
+            })
+            .collect();
+        if !mode_select_options.is_empty() {
+            options.push(
+                acp::SessionConfigOption::select(
+                    ConfigOptionId::Mode.to_string(),
+                    "Mode",
+                    current_agent_id.to_string(),
+                    mode_select_options,
+                )
+                .category(acp::SessionConfigOptionCategory::Mode),
+            );
+        }
+
+        // ── Model config option ───────────────────────────────────────────
+        let model_select_options: Vec<acp::SessionConfigSelectOption> = model_state
+            .available_models
+            .iter()
+            .map(|m| {
+                acp::SessionConfigSelectOption::new(
+                    m.model_id.0.as_ref().to_string(),
+                    m.name.clone(),
+                )
+            })
+            .collect();
+        if !model_select_options.is_empty() {
+            options.push(
+                acp::SessionConfigOption::select(
+                    ConfigOptionId::Model.to_string(),
+                    "Model",
+                    model_state.current_model_id.0.as_ref().to_string(),
+                    model_select_options,
+                )
+                .category(acp::SessionConfigOptionCategory::Model),
+            );
+        }
+
+        // ── Reasoning effort config option ────────────────────────────────
+        let current_effort = services
+            .config_service()
+            .get_reasoning_effort()
+            .await
+            .ok()
+            .flatten();
+        let current_effort_value = current_effort
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "medium".to_string());
+        let effort_select_options: Vec<acp::SessionConfigSelectOption> = [
+            ("none", "None"),
+            ("minimal", "Minimal"),
+            ("low", "Low"),
+            ("medium", "Medium"),
+            ("high", "High"),
+            ("xhigh", "X-High"),
+            ("max", "Max"),
+        ]
+        .iter()
+        .map(|(val, name)| acp::SessionConfigSelectOption::new(*val, *name))
+        .collect();
+        options.push(
+            acp::SessionConfigOption::select(
+                ConfigOptionId::ReasoningEffort.to_string(),
+                "Reasoning Effort",
+                current_effort_value,
+                effort_select_options,
+            )
+            .category(acp::SessionConfigOptionCategory::ThoughtLevel),
+        );
+
+        options
     }
 }
 

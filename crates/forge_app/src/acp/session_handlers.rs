@@ -4,6 +4,7 @@ use forge_domain::{AgentId, ConfigOperation, Conversation, ConversationId, Model
 
 use crate::{AgentRegistry, AppConfigService, ConversationService, EnvironmentInfra, Services};
 use super::adapter::{AcpAdapter, SessionState};
+use super::conversion::ConfigOptionId;
 use super::error;
 use super::state_builders::StateBuilders;
 
@@ -116,10 +117,18 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
         let model_state = StateBuilders::build_session_model_state(&self.services, &agent, None)
             .await
             .map_err(error::into_acp_error)?;
+        let config_options = StateBuilders::build_config_options(
+            self.services.as_ref(),
+            &active_agent_id,
+            &mode_state,
+            &model_state,
+        )
+        .await;
 
         Ok(acp::NewSessionResponse::new(session_id)
             .modes(mode_state)
-            .models(model_state))
+            .models(model_state)
+            .config_options(config_options))
     }
 
     pub(super) async fn handle_load_session(
@@ -174,10 +183,18 @@ impl<S: Services + EnvironmentInfra<Config = ForgeConfig>> AcpAdapter<S> {
         let model_state = StateBuilders::build_session_model_state(&self.services, &agent, state.model_id.as_ref())
             .await
             .map_err(error::into_acp_error)?;
+        let config_options = StateBuilders::build_config_options(
+            self.services.as_ref(),
+            &state.agent_id,
+            &mode_state,
+            &model_state,
+        )
+        .await;
 
         Ok(acp::LoadSessionResponse::new()
             .modes(mode_state)
-            .models(model_state))
+            .models(model_state)
+            .config_options(config_options))
     }
 
     pub(super) async fn handle_list_sessions(
@@ -407,7 +424,7 @@ mod tests {
     use forge_domain::{
         Agent, AgentId, AnyProvider, Attachment, AuthContextRequest, AuthContextResponse,
         AuthMethod, ChatCompletionMessage, CommandOutput, ConfigOperation, Context, Conversation,
-        ConversationId, File, FileStatus, Image, McpConfig, McpServers, Model, ModelConfig,
+        ConversationId, Effort, File, FileStatus, Image, McpConfig, McpServers, Model, ModelConfig,
         ModelId, Node, Provider, ProviderId, ProviderResponse, ProviderType, Scope, SearchParams,
         Skill, SyncProgress, Template, ToolCallFull, ToolOutput, URLParamSpec, WorkspaceAuth,
         WorkspaceId, WorkspaceInfo,
@@ -444,6 +461,7 @@ mod tests {
         config: ForgeConfig,
     }
 
+    #[derive(Clone)]
     struct MockState {
         active_agent_id: Option<AgentId>,
         agents: Vec<Agent>,
@@ -452,8 +470,9 @@ mod tests {
         models: Vec<Model>,
         mcp_config: McpConfig,
         config_updates: Vec<Vec<ConfigOperation>>,
+        env_updates: Vec<Vec<ConfigOperation>>,
+        reasoning_effort: Option<Effort>,
     }
-
     #[derive(Clone)]
     struct MockProviderService {
         state: SharedState,
@@ -520,6 +539,8 @@ mod tests {
                 models: vec![model],
                 mcp_config: McpConfig::default(),
                 config_updates: Vec::new(),
+                env_updates: Vec::new(),
+                reasoning_effort: None,
             })));
 
             Self {
@@ -567,6 +588,16 @@ mod tests {
                 .config_updates
                 .clone()
         }
+
+        fn env_updates(&self) -> Vec<Vec<ConfigOperation>> {
+            self.config_service
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .env_updates
+                .clone()
+        }
     }
 
     impl EnvironmentInfra for MockServices {
@@ -590,9 +621,19 @@ mod tests {
 
         fn update_environment(
             &self,
-            _ops: Vec<ConfigOperation>,
+            ops: Vec<ConfigOperation>,
         ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
-            async { Ok(()) }
+            let state = self.config_service.state.0.clone();
+            async move {
+                let mut guard = state.lock().unwrap();
+                for op in &ops {
+                    if let ConfigOperation::SetReasoningEffort(effort) = op {
+                        guard.reasoning_effort = Some(effort.clone());
+                    }
+                }
+                guard.env_updates.push(ops);
+                Ok(())
+            }
         }
     }
 
@@ -652,7 +693,7 @@ mod tests {
         }
 
         async fn get_reasoning_effort(&self) -> anyhow::Result<Option<forge_domain::Effort>> {
-            Ok(None)
+            Ok(self.state.0.lock().unwrap().reasoning_effort.clone())
         }
 
         async fn update_config(&self, ops: Vec<ConfigOperation>) -> anyhow::Result<()> {
@@ -1414,5 +1455,145 @@ mod tests {
             .unwrap();
 
         assert!(actual.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_session_includes_reasoning_effort_config_option() {
+        let services = MockServices::new();
+        let adapter = AcpAdapter::new_for_test(services);
+
+        let actual = adapter
+            .handle_new_session(acp::NewSessionRequest::new(PathBuf::from("/tmp/project")))
+            .await
+            .unwrap();
+
+        let config_options = actual.config_options.unwrap();
+        let effort_option = config_options
+            .iter()
+            .find(|opt| opt.id.0.as_ref() == "reasoning_effort")
+            .expect("Should have reasoning_effort config option");
+
+        assert_eq!(effort_option.name, "Reasoning Effort");
+        assert_eq!(
+            effort_option.category,
+            Some(acp::SessionConfigOptionCategory::ThoughtLevel)
+        );
+
+        match &effort_option.kind {
+            acp::SessionConfigKind::Select(select) => {
+                assert_eq!(select.current_value, "medium".into());
+                let values: Vec<&str> = match &select.options {
+                    acp::SessionConfigSelectOptions::Ungrouped(opts) => {
+                        opts.iter().map(|o| o.value.0.as_ref()).collect()
+                    }
+                    _ => panic!("Expected Ungrouped options"),
+                };
+                assert_eq!(
+                    values,
+                    vec![
+                        "none", "minimal", "low", "medium", "high", "xhigh", "max"
+                    ]
+                );
+            }
+            _ => panic!("Expected SessionConfigKind::Select"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_config_option_updates_reasoning_effort() {
+        let services = MockServices::new();
+        let adapter = AcpAdapter::new_for_test(services.clone());
+
+        let new_session = adapter
+            .handle_new_session(acp::NewSessionRequest::new(PathBuf::from("/tmp/project")))
+            .await
+            .unwrap();
+
+        let response = adapter
+            .handle_set_session_config_option(
+                acp::SetSessionConfigOptionRequest::new(
+                    new_session.session_id,
+                    acp::SessionConfigId::from("reasoning_effort"),
+                    acp::SessionConfigValueId::from("high"),
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Verify the response contains updated config_options
+        let updated_options = response.config_options;
+        let effort_option = updated_options
+            .iter()
+            .find(|opt| opt.id.0.as_ref() == "reasoning_effort")
+            .expect("Should have reasoning_effort in response");
+
+        match &effort_option.kind {
+            acp::SessionConfigKind::Select(select) => {
+                assert_eq!(select.current_value, "high".into());
+            }
+            _ => panic!("Expected SessionConfigKind::Select"),
+        }
+
+        // Verify environment was actually updated
+        let updates = services.env_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0],
+            vec![ConfigOperation::SetReasoningEffort(Effort::High)]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_config_option_rejects_unknown_config_id() {
+        let services = MockServices::new();
+        let adapter = AcpAdapter::new_for_test(services);
+        let new_session = adapter
+            .handle_new_session(acp::NewSessionRequest::new(PathBuf::from("/tmp/project")))
+            .await
+            .unwrap();
+
+        let result = adapter
+            .handle_set_session_config_option(
+                acp::SetSessionConfigOptionRequest::new(
+                    new_session.session_id,
+                    acp::SessionConfigId::from("unknown_option"),
+                    acp::SessionConfigValueId::from("whatever"),
+                ),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, acp::ErrorCode::MethodNotFound);
+    }
+
+    #[tokio::test]
+    async fn set_config_option_returns_config_options_on_success() {
+        let services = MockServices::new();
+        let adapter = AcpAdapter::new_for_test(services);
+        let new_session = adapter
+            .handle_new_session(acp::NewSessionRequest::new(PathBuf::from("/tmp/project")))
+            .await
+            .unwrap();
+
+        let response = adapter
+            .handle_set_session_config_option(
+                acp::SetSessionConfigOptionRequest::new(
+                    new_session.session_id,
+                    acp::SessionConfigId::from("reasoning_effort"),
+                    acp::SessionConfigValueId::from("max"),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(!response.config_options.is_empty());
+
+        // Should still contain the reasoning_effort option
+        let effort_option = response
+            .config_options
+            .iter()
+            .find(|opt| opt.id.0.as_ref() == "reasoning_effort");
+        assert!(effort_option.is_some());
     }
 }

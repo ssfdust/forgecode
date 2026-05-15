@@ -1,4 +1,6 @@
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use agent_client_protocol as acp;
 use forge_domain::{
@@ -6,7 +8,42 @@ use forge_domain::{
     ToolValue,
 };
 
-use super::error::{Error, Result};
+use super::error::{self, Error};
+
+/// Known session config option identifiers used in ACP `configOptions`.
+///
+/// These are the `id` values returned in `session/new` and consumed by
+/// `session/set_config_option`. The enum provides type-safe dispatch over
+/// the stringly-typed ACP protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfigOptionId {
+    Mode,
+    Model,
+    ReasoningEffort,
+}
+
+impl fmt::Display for ConfigOptionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mode => write!(f, "mode"),
+            Self::Model => write!(f, "model"),
+            Self::ReasoningEffort => write!(f, "reasoning_effort"),
+        }
+    }
+}
+
+impl FromStr for ConfigOptionId {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "mode" => Ok(Self::Mode),
+            "model" => Ok(Self::Model),
+            "reasoning_effort" => Ok(Self::ReasoningEffort),
+            _ => Err(()),
+        }
+    }
+}
 
 /// Maximum size in bytes for base64-encoded blob resources.
 /// Protects against OOM from oversized client payloads.
@@ -141,7 +178,7 @@ fn convert_text(text: &str) -> Option<acp::ToolCallContent> {
     }
 }
 
-pub(crate) fn acp_resource_to_attachment(resource: &acp::EmbeddedResource) -> Result<Attachment> {
+pub(crate) fn acp_resource_to_attachment(resource: &acp::EmbeddedResource) -> error::Result<Attachment> {
     let (content_text, uri) = match &resource.resource {
         acp::EmbeddedResourceResource::TextResourceContents(text_resource) => {
             (text_resource.text.clone(), text_resource.uri.clone())
